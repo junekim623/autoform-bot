@@ -28,7 +28,7 @@ _DECLARATION = re.compile(
     r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+"
     r"([^\s:(){}\[\]⦃⦄,]+)"
 )
-_IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
+IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +62,7 @@ def index_project(root: str | Path) -> SourceIndex:
         return SourceIndex(root=root_path, declarations=declarations, occurrences={})
 
     for path in sorted(root_path.rglob("*.lean")):
-        if _IGNORED_DIRECTORIES.intersection(path.relative_to(root_path).parts):
+        if IGNORED_DIRECTORIES.intersection(path.relative_to(root_path).parts):
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -250,6 +250,7 @@ def _git(root: str | Path, *arguments: str) -> str | None:
 
 
 __all__ = [
+    "IGNORED_DIRECTORIES",
     "Declaration",
     "SourceIndex",
     "SourceLinker",
@@ -258,4 +259,5 @@ __all__ = [
     "detect_ref",
     "detect_repository_url",
     "index_project",
+    "repository_linker",
 ]

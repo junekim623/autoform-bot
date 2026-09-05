@@ -144,6 +144,11 @@ Use the CLI's `url` field verbatim rather than joining `path` yourself. When the
 Lean project is nested inside a larger repository, `path` is relative to the
 Lean root while `url` is already resolved against the repository root.
 
+Pinning is decided per declaration, not per snapshot: the CLI emits a `url`
+whenever that declaration's own file matches `HEAD`. A partly dirty checkout
+therefore still yields immutable links for every untouched file, and only the
+declarations you are actively editing come back with `url` set to `null`.
+
 For an uncommitted snapshot, use absolute local file links and label them as
 local and mutable. On the next invocation after a commit, replace them with
 commit-pinned links. Never retain an old link merely because its declaration

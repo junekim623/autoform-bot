@@ -298,19 +298,55 @@ def test_nested_lean_root_links_through_the_repository_path(
     assert report.as_dict()["definitions"][0]["path"] == "Demo.lean"
 
 
-def test_changes_outside_the_lean_root_do_not_dirty_the_snapshot(
-    tmp_path: Path,
-) -> None:
+def test_only_uncommitted_lean_sources_block_a_permalink(tmp_path: Path) -> None:
     _repository(tmp_path)
     lean_root = tmp_path / "consumer"
     lean_root.mkdir()
     (lean_root / "Demo.lean").write_text("def Existing : Nat := 0\n", encoding="utf-8")
+    (lean_root / "Other.lean").write_text("def Stable : Nat := 1\n", encoding="utf-8")
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-qm", "base")
+
+    assert closure_module._uncommitted_sources(lean_root, Path("consumer/")) == frozenset()
+
+    # Build output and work on other projects leave every source line pinned.
+    (lean_root / "lake-manifest.json").write_text("{}\n", encoding="utf-8")
     (tmp_path / "UNRELATED.md").write_text("noise outside the Lean project\n", encoding="utf-8")
 
-    assert closure_module._has_relevant_changes(lean_root) is False
-    assert closure_module._has_relevant_changes(tmp_path) is True
+    assert closure_module._uncommitted_sources(lean_root, Path("consumer/")) == frozenset()
+
+    (lean_root / "Demo.lean").write_text("def Existing : Nat := 2\n", encoding="utf-8")
+
+    assert closure_module._uncommitted_sources(lean_root, Path("consumer/")) == frozenset(
+        {Path("Demo.lean")}
+    )
+
+
+def test_only_declarations_in_edited_files_lose_their_link(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    _git(tmp_path, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    report = ClosureReport(
+        root=tmp_path,
+        base="base",
+        head="deadbeef",
+        dirty=True,
+        modules=("Demo",),
+        roots=(Declaration("Root", Path("Edited.lean"), 4, "theorem"),),
+        reachable=(
+            Declaration("Stable", Path("Pinned.lean"), 2, "def"),
+            Declaration("Moving", Path("Edited.lean"), 1, "def"),
+        ),
+        dependency_edges=(),
+        uncommitted=frozenset({Path("Edited.lean")}),
+    )
+
+    urls = {
+        item["name"]: item["url"]
+        for item in report.as_dict()["reachable"]
+    }
+
+    assert urls["Moving"] is None
+    assert urls["Stable"] is not None and urls["Stable"].endswith("Pinned.lean#L2")
 
 
 def test_private_root_resolves_through_its_display_name(
@@ -430,8 +466,11 @@ def test_lean_name_literals_survive_question_marks_and_odd_components() -> None:
 
 
 def test_build_cache_does_not_make_snapshot_dirty(tmp_path: Path) -> None:
-    _git(tmp_path, "init", "-q")
-    (tmp_path / ".lake").mkdir()
-    (tmp_path / ".lake/cache").write_text("generated\n", encoding="utf-8")
+    _repository(tmp_path)
+    (tmp_path / "Demo.lean").write_text("def Existing : Nat := 0\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    (tmp_path / ".lake/build").mkdir(parents=True)
+    (tmp_path / ".lake/build/Vendored.lean").write_text("def Cached : Nat := 0\n", encoding="utf-8")
 
-    assert closure_module._has_relevant_changes(tmp_path) is False
+    assert closure_module._uncommitted_sources(tmp_path, Path(".")) == frozenset()

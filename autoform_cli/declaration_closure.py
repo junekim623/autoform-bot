@@ -10,7 +10,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .lean import Declaration, index_project, repository_linker
+from .lean import IGNORED_DIRECTORIES, Declaration, index_project, repository_linker
 
 _NAME = re.compile(r"[\w'!?.]+", re.UNICODE)
 _COMPONENT = re.compile(r"[\w'!?]+", re.UNICODE)
@@ -38,6 +38,7 @@ class ClosureReport:
     reachable: tuple[Declaration, ...]
     dependency_edges: tuple[tuple[str, str], ...]
     prefix: str = ""
+    uncommitted: frozenset[Path] = frozenset()
 
     @property
     def definitions(self) -> tuple[Declaration, ...]:
@@ -60,12 +61,15 @@ class ClosureReport:
                 if self.prefix
                 else declaration
             )
+            # Only the declaration's own file has to match HEAD for its link to
+            # pin: an edit elsewhere cannot move these lines.
+            pinned = declaration.path not in self.uncommitted
             return {
                 "keyword": declaration.keyword,
                 "line": declaration.line,
                 "name": declaration.name,
                 "path": declaration.path.as_posix(),
-                "url": None if self.dirty else linker.declaration_url(linked),
+                "url": linker.declaration_url(linked) if pinned else None,
             }
 
         return {
@@ -115,6 +119,9 @@ def declaration_closure(
 
     prefix = Path(_git(root, "rev-parse", "--show-prefix"))
     comparison = _merge_base(root, base)
+    # Read the snapshot before `lake build`, so artifacts this command generates
+    # are never mistaken for the reviewer's uncommitted work.
+    uncommitted = _uncommitted_sources(root, prefix)
     all_declarations = (
         declaration
         for occurrences in index.occurrences.values()
@@ -154,12 +161,13 @@ def declaration_closure(
         root=root,
         base=comparison,
         head=_git(root, "rev-parse", "HEAD"),
-        dirty=_has_relevant_changes(root),
+        dirty=bool(uncommitted),
         modules=tuple(modules),
         roots=root_declarations,
         reachable=reachable,
         dependency_edges=dependency_edges,
         prefix=prefix.as_posix() if prefix != Path(".") else "",
+        uncommitted=uncommitted,
     )
 
 
@@ -257,6 +265,17 @@ def _merge_base(root: Path, base: str) -> str:
         return _git(root, "rev-parse", base)
 
 
+def _local_path(raw: str, prefix: Path) -> Path:
+    """Rebase a repository-relative git path onto the Lean root."""
+    path = Path(raw)
+    if prefix == Path("."):
+        return path
+    try:
+        return path.relative_to(prefix)
+    except ValueError:
+        return path
+
+
 def _changed_declarations(
     root: Path, base: str, prefix: Path, declarations: Iterable[Declaration]
 ) -> set[str]:
@@ -265,13 +284,7 @@ def _changed_declarations(
         by_path.setdefault(declaration.path, []).append(declaration)
 
     def local_path(raw: str) -> Path:
-        path = Path(raw)
-        if prefix == Path("."):
-            return path
-        try:
-            return path.relative_to(prefix)
-        except ValueError:
-            return path
+        return _local_path(raw, prefix)
 
     statuses: dict[Path, str] = {}
     output = _git(root, "diff", "--name-status", "--find-renames", base, "--", "*.lean")
@@ -334,16 +347,25 @@ def _git(root: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def _has_relevant_changes(root: Path) -> bool:
-    ignored = frozenset({".git", ".lake", "build", "lake-packages"})
-    # Scope to the Lean root: unrelated work elsewhere in a monorepo must not
-    # invalidate the links for this project.
-    status = _git(root, "status", "--porcelain", "--untracked-files=all", "--", ".")
-    for line in status.splitlines():
-        raw_path = line[3:].split(" -> ")[-1]
-        if not ignored.intersection(Path(raw_path).parts):
-            return True
-    return False
+def _uncommitted_sources(root: Path, prefix: Path) -> frozenset[Path]:
+    """Return Lean sources under *root* that a permalink cannot pin to HEAD.
+
+    Only ``*.lean`` files matter: a link addresses a line in one source file, so
+    a rebuilt manifest, a regenerated site, or an edit to another project in the
+    same repository leaves that line exactly where the commit says it is.
+    """
+    modified = _git(root, "diff", "--name-only", "HEAD", "--", "*.lean")
+    untracked = _git(
+        root, "ls-files", "--others", "--exclude-standard", "--full-name", "--", "*.lean"
+    )
+    paths = {
+        _local_path(line, prefix)
+        for line in (*modified.splitlines(), *untracked.splitlines())
+        if line
+    }
+    return frozenset(
+        path for path in paths if not IGNORED_DIRECTORIES.intersection(path.parts)
+    )
 
 
 def _run(root: Path, command: list[str], stage: str) -> str:

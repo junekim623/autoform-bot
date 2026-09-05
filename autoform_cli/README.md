@@ -168,8 +168,16 @@ approximate source-text closure. Repeat `--module` and `--root` for multiple
 entries.
 
 `--lean-root` may point at a Lean project nested inside a larger repository. In
-that case `path` stays relative to the Lean root, `url` resolves against the
-repository root, and the dirty check considers only files under the Lean root.
+that case `path` stays relative to the Lean root and `url` resolves against the
+repository root.
+
+A `url` is emitted whenever the declaration's own `*.lean` file matches `HEAD`,
+so one file being edited does not unpin the rest of the closure, and build
+output such as a regenerated `lake-manifest.json` never unpins anything. The
+snapshot is read before `lake build` runs, so artifacts this command itself
+generates are not mistaken for uncommitted work. `dirty` reports whether any
+Lean source in the closure's project is uncommitted; treat a `null` `url` as
+the per-declaration signal.
 
 Validate structure, and optionally check that every `lean:` name really exists
 in the project's Lean sources:
