@@ -79,10 +79,19 @@ autoform declaration-closure --lean-root . --base BASE_SHA \
   --module Project.Entry --root Project.result --json
 ```
 
+Pass the base branch or its fork point to `--base`. The CLI resolves it through
+its merge base with `HEAD`, so work that landed on the base branch after the
+fork point is never reported as part of this snapshot.
+
 The CLI builds and imports the requested modules, reads Lean's elaborated
 constant expressions, traverses root types and reachable definition values,
 and intersects the result with declarations added or changed relative to the
-Git base. Its JSON result is the sole authority for closure membership. Do not
+Git base. A declaration counts as changed when the diff adds or deletes lines
+inside it, so a removed structure field is caught as well as an added one. An
+introduced `axiom` is reported in `definitions` beside the definitions; call it
+out explicitly, because a new assumption is the most review-critical thing a
+snapshot can contain. Its JSON result is the sole authority for closure
+membership. Do not
 add or remove closure entries based on an LLM reading of identifiers. The
 `definitions` array is already dependency-first topologically ordered; preserve
 that order in the Markdown. `dependency_edges` records the graph used for the
@@ -130,6 +139,10 @@ URLs at the full commit SHA:
 ```text
 https://github.com/OWNER/REPO/blob/FULL_COMMIT_SHA/path/to/File.lean#L123
 ```
+
+Use the CLI's `url` field verbatim rather than joining `path` yourself. When the
+Lean project is nested inside a larger repository, `path` is relative to the
+Lean root while `url` is already resolved against the repository root.
 
 For an uncommitted snapshot, use absolute local file links and label them as
 local and mutable. On the next invocation after a commit, replace them with

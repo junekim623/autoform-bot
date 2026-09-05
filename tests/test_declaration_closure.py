@@ -7,7 +7,7 @@ from pathlib import Path
 from autoform_cli import declaration_closure as closure_module
 from autoform_cli.__main__ import main
 from autoform_cli.declaration_closure import ClosureReport, declaration_closure
-from autoform_cli.lean import Declaration
+from autoform_cli.lean import Declaration, index_project
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -15,6 +15,24 @@ def _git(root: Path, *arguments: str) -> str:
         ["git", *arguments], cwd=root, capture_output=True, text=True, check=True
     )
     return result.stdout.strip()
+
+
+def _repository(root: Path) -> None:
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "autoform@example.invalid")
+    _git(root, "config", "user.name", "Autoform Test")
+
+
+def _changed(lean_root: Path, base: str, prefix: str = ".") -> set[str]:
+    index = index_project(lean_root)
+    declarations = [
+        declaration
+        for occurrences in index.occurrences.values()
+        for declaration in occurrences
+    ]
+    return closure_module._changed_declarations(
+        lean_root, base, Path(prefix), declarations
+    )
 
 
 def _project(tmp_path: Path) -> tuple[Path, str]:
@@ -234,6 +252,181 @@ def test_declaration_closure_cli_fails_closed_when_build_fails(
     assert capsys.readouterr().err == (
         "error: lake build failed; exact closure unavailable\n"
     )
+
+
+def test_nested_lean_root_links_through_the_repository_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _repository(tmp_path)
+    _git(tmp_path, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    lean_root = tmp_path / "consumer"
+    lean_root.mkdir()
+    source = lean_root / "Demo.lean"
+    source.write_text("def Existing : Nat := 0\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    source.write_text(
+        "def Existing : Nat := 0\ndef Added : Nat := 1\ntheorem Root : Added = 1 := by rfl\n",
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "work")
+    head = _git(tmp_path, "rev-parse", "HEAD")
+
+    def fake_run(_root: Path, _command: list[str], stage: str) -> str:
+        return (
+            ""
+            if stage == "lake build"
+            else (
+                "AUTOFORM_DECLARATION_NODE\tAdded\n"
+                "AUTOFORM_DECLARATION_SOURCE\tAdded\tAdded\tDemo\n"
+                "AUTOFORM_DECLARATION_NODE\tRoot\n"
+                "AUTOFORM_DECLARATION_SOURCE\tRoot\tRoot\tDemo\n"
+            )
+        )
+
+    monkeypatch.setattr(closure_module, "_run", fake_run)
+    report = declaration_closure(
+        lean_root, base=base, modules=["Demo"], roots=["Root"]
+    )
+
+    assert report.dirty is False
+    assert report.as_dict()["definitions"][0]["url"] == (
+        f"https://github.com/owner/repo/blob/{head}/consumer/Demo.lean#L2"
+    )
+    assert report.as_dict()["definitions"][0]["path"] == "Demo.lean"
+
+
+def test_changes_outside_the_lean_root_do_not_dirty_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    _repository(tmp_path)
+    lean_root = tmp_path / "consumer"
+    lean_root.mkdir()
+    (lean_root / "Demo.lean").write_text("def Existing : Nat := 0\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    (tmp_path / "UNRELATED.md").write_text("noise outside the Lean project\n", encoding="utf-8")
+
+    assert closure_module._has_relevant_changes(lean_root) is False
+    assert closure_module._has_relevant_changes(tmp_path) is True
+
+
+def test_private_root_resolves_through_its_display_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _repository(tmp_path)
+    source = tmp_path / "Demo.lean"
+    source.write_text("def X : Nat := 0\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    source.write_text(
+        "def X : Nat := 0\nprivate theorem Root : X = 0 := rfl\n", encoding="utf-8"
+    )
+
+    def fake_run(_root: Path, _command: list[str], stage: str) -> str:
+        return (
+            ""
+            if stage == "lake build"
+            else (
+                "AUTOFORM_DECLARATION_NODE\t_private.Demo.0.Root\n"
+                "AUTOFORM_DECLARATION_SOURCE\t_private.Demo.0.Root\tRoot\tDemo\n"
+            )
+        )
+
+    monkeypatch.setattr(closure_module, "_run", fake_run)
+    report = declaration_closure(
+        tmp_path, base=base, modules=["Demo"], roots=["Root"]
+    )
+
+    assert [declaration.name for declaration in report.roots] == ["Root"]
+
+
+def test_deletion_only_edit_marks_its_declaration_changed(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    source = tmp_path / "Demo.lean"
+    source.write_text(
+        "def Untouched : Nat := 0\n\n"
+        "structure Shape where\n  width : Nat\n  height : Nat\n  depth : Nat\n\n"
+        "def After : Nat := 1\n",
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    source.write_text(
+        "def Untouched : Nat := 0\n\n"
+        "structure Shape where\n  width : Nat\n  height : Nat\n\n"
+        "def After : Nat := 1\n",
+        encoding="utf-8",
+    )
+
+    assert _changed(tmp_path, base) == {"Shape"}
+
+
+def test_merge_base_excludes_work_only_on_the_base_branch(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    (tmp_path / "Demo.lean").write_text("def Shared : Nat := 0\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    fork_point = _git(tmp_path, "rev-parse", "HEAD")
+    base_branch = _git(tmp_path, "rev-parse", "--abbrev-ref", "HEAD")
+    _git(tmp_path, "checkout", "-qb", "feature")
+    (tmp_path / "Demo.lean").write_text(
+        "def Shared : Nat := 0\ndef Mine : Nat := 1\n", encoding="utf-8"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "mine")
+    _git(tmp_path, "checkout", "-q", base_branch)
+    (tmp_path / "Other.lean").write_text("def TheirsOnBase : Nat := 2\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "theirs")
+    base_tip = _git(tmp_path, "rev-parse", "HEAD")
+    _git(tmp_path, "checkout", "-q", "feature")
+
+    assert closure_module._merge_base(tmp_path, base_tip) == fork_point
+    assert _changed(tmp_path, closure_module._merge_base(tmp_path, base_tip)) == {"Mine"}
+
+
+def test_untracked_file_in_a_nested_lean_root_is_detected(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    lean_root = tmp_path / "consumer"
+    lean_root.mkdir()
+    (lean_root / "Demo.lean").write_text("def Existing : Nat := 0\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    (lean_root / "Fresh.lean").write_text("def BrandNew : Nat := 7\n", encoding="utf-8")
+
+    assert _changed(lean_root, base, "consumer/") == {"BrandNew"}
+
+
+def test_introduced_axiom_is_reported_for_review(tmp_path: Path) -> None:
+    report = ClosureReport(
+        root=tmp_path,
+        base="base",
+        head="head",
+        dirty=True,
+        modules=("Demo",),
+        roots=(Declaration("Root", Path("Demo.lean"), 9, "theorem"),),
+        reachable=(
+            Declaration("Assumed", Path("Demo.lean"), 3, "axiom"),
+            Declaration("Root", Path("Demo.lean"), 9, "theorem"),
+        ),
+        dependency_edges=(("Root", "Assumed"),),
+    )
+
+    assert [declaration.name for declaration in report.definitions] == ["Assumed"]
+
+
+def test_lean_name_literals_survive_question_marks_and_odd_components() -> None:
+    assert closure_module._NAME.fullmatch("Std.HashMap.get?")
+    assert closure_module._NAME.fullmatch("Array.get!")
+    assert closure_module._lean_name("Std.HashMap.get?") == "`Std.HashMap.get?"
+    assert closure_module._lean_name("Demo.b+c") == "`Demo.«b+c»"
+    assert closure_module._lean_name("Demo.«already quoted»") == "`Demo.«already quoted»"
 
 
 def test_build_cache_does_not_make_snapshot_dirty(tmp_path: Path) -> None:

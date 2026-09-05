@@ -7,15 +7,16 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .lean import Declaration, build_linker, index_project
+from .lean import Declaration, index_project, repository_linker
 
-_NAME = re.compile(r"^[\w'.]+$", re.UNICODE)
+_NAME = re.compile(r"[\w'!?.]+", re.UNICODE)
+_COMPONENT = re.compile(r"[\w'!?]+", re.UNICODE)
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _DEFINITION_KEYWORDS = frozenset(
-    {"abbrev", "class", "def", "inductive", "instance", "opaque", "structure"}
+    {"abbrev", "axiom", "class", "def", "inductive", "instance", "opaque", "structure"}
 )
 _NODE_MARKER = "AUTOFORM_DECLARATION_NODE\t"
 _EDGE_MARKER = "AUTOFORM_DECLARATION_EDGE\t"
@@ -36,6 +37,7 @@ class ClosureReport:
     roots: tuple[Declaration, ...]
     reachable: tuple[Declaration, ...]
     dependency_edges: tuple[tuple[str, str], ...]
+    prefix: str = ""
 
     @property
     def definitions(self) -> tuple[Declaration, ...]:
@@ -48,15 +50,22 @@ class ClosureReport:
         )
 
     def as_dict(self) -> dict[str, object]:
-        linker = build_linker(self.root, ref=self.head)
+        linker = repository_linker(self.root, ref=self.head)
 
         def item(declaration: Declaration) -> dict[str, object]:
+            # Paths are relative to the Lean root, but links are relative to the
+            # repository root, which differs whenever the Lean project is nested.
+            linked = (
+                replace(declaration, path=Path(self.prefix) / declaration.path)
+                if self.prefix
+                else declaration
+            )
             return {
                 "keyword": declaration.keyword,
                 "line": declaration.line,
                 "name": declaration.name,
                 "path": declaration.path.as_posix(),
-                "url": None if self.dirty else linker.declaration_url(declaration),
+                "url": None if self.dirty else linker.declaration_url(linked),
             }
 
         return {
@@ -104,12 +113,14 @@ def declaration_closure(
     if missing:
         raise DeclarationClosureError(f"root declaration not found in sources: {missing[0]}")
 
+    prefix = Path(_git(root, "rev-parse", "--show-prefix"))
+    comparison = _merge_base(root, base)
     all_declarations = (
         declaration
         for occurrences in index.occurrences.values()
         for declaration in occurrences
     )
-    changed = _changed_declarations(root, base, all_declarations)
+    changed = _changed_declarations(root, comparison, prefix, all_declarations)
     allowed = sorted(changed)
     _run(root, ["lake", "build", *modules], "lake build")
     source = _lean_driver(modules, roots, allowed)
@@ -131,16 +142,24 @@ def declaration_closure(
     )
     display_names = {actual: display for actual, (display, _) in source_names.items()}
     dependency_edges = _source_dependency_edges(display_names, edges)
-    root_declarations = tuple(resolved[name] for name in roots)
+    # Lean mangles private names, so roots must be matched on their display name.
+    by_display = {display: resolved[actual] for actual, display in display_names.items()}
+    unresolved = [name for name in roots if name not in by_display]
+    if unresolved:
+        raise DeclarationClosureError(
+            f"root declaration missing from the elaborated closure: {unresolved[0]}"
+        )
+    root_declarations = tuple(by_display[name] for name in roots)
     return ClosureReport(
         root=root,
-        base=_git(root, "rev-parse", base),
+        base=comparison,
         head=_git(root, "rev-parse", "HEAD"),
         dirty=_has_relevant_changes(root),
         modules=tuple(modules),
         roots=root_declarations,
         reachable=reachable,
         dependency_edges=dependency_edges,
+        prefix=prefix.as_posix() if prefix != Path(".") else "",
     )
 
 
@@ -230,14 +249,20 @@ def _source_dependency_edges(
     return tuple(sorted(result))
 
 
+def _merge_base(root: Path, base: str) -> str:
+    """Resolve *base* to its fork point so unrelated base-branch work is excluded."""
+    try:
+        return _git(root, "merge-base", base, "HEAD")
+    except DeclarationClosureError:
+        return _git(root, "rev-parse", base)
+
+
 def _changed_declarations(
-    root: Path, base: str, declarations: Iterable[Declaration]
+    root: Path, base: str, prefix: Path, declarations: Iterable[Declaration]
 ) -> set[str]:
     by_path: dict[Path, list[Declaration]] = {}
     for declaration in declarations:
         by_path.setdefault(declaration.path, []).append(declaration)
-
-    prefix = Path(_git(root, "rev-parse", "--show-prefix"))
 
     def local_path(raw: str) -> Path:
         path = Path(raw)
@@ -258,7 +283,9 @@ def _changed_declarations(
         path = local_path(fields[-1])
         if status != "D":
             statuses[path] = status
-    untracked = _git(root, "ls-files", "--others", "--exclude-standard", "--", "*.lean")
+    untracked = _git(
+        root, "ls-files", "--others", "--exclude-standard", "--full-name", "--", "*.lean"
+    )
     statuses.update({local_path(line): "A" for line in untracked.splitlines() if line})
 
     changed: set[str] = set()
@@ -267,19 +294,19 @@ def _changed_declarations(
         if status == "A":
             changed.update(d.name for d in declarations_in_file)
             continue
-        added_lines = _added_lines(root, base, path)
+        touched = _touched_lines(root, base, path)
         for index, declaration in enumerate(declarations_in_file):
             next_line = (
                 declarations_in_file[index + 1].line
                 if index + 1 < len(declarations_in_file)
                 else 1 << 60
             )
-            if any(declaration.line <= line < next_line for line in added_lines):
+            if any(declaration.line <= line < next_line for line in touched):
                 changed.add(declaration.name)
     return changed
 
 
-def _added_lines(root: Path, base: str, path: Path) -> set[int]:
+def _touched_lines(root: Path, base: str, path: Path) -> set[int]:
     output = _git(root, "diff", "--unified=0", "--no-color", base, "--", path.as_posix())
     lines: set[int] = set()
     for line in output.splitlines():
@@ -288,7 +315,12 @@ def _added_lines(root: Path, base: str, path: Path) -> set[int]:
             continue
         start = int(match.group(1))
         count = int(match.group(2) or "1")
-        lines.update(range(start, start + count))
+        if count:
+            lines.update(range(start, start + count))
+            continue
+        # A pure deletion reports zero added lines at the seam between the
+        # surviving lines, so attribute it to the declarations on either side.
+        lines.update({max(start, 1), start + 1})
     return lines
 
 
@@ -304,7 +336,9 @@ def _git(root: Path, *arguments: str) -> str:
 
 def _has_relevant_changes(root: Path) -> bool:
     ignored = frozenset({".git", ".lake", "build", "lake-packages"})
-    status = _git(root, "status", "--porcelain", "--untracked-files=all")
+    # Scope to the Lean root: unrelated work elsewhere in a monorepo must not
+    # invalidate the links for this project.
+    status = _git(root, "status", "--porcelain", "--untracked-files=all", "--", ".")
     for line in status.splitlines():
         raw_path = line[3:].split(" -> ")[-1]
         if not ignored.intersection(Path(raw_path).parts):
@@ -325,12 +359,23 @@ def _run(root: Path, command: list[str], stage: str) -> str:
     return result.stdout
 
 
+def _lean_name(name: str) -> str:
+    """Quote *name* as a Lean name literal, escaping non-identifier components."""
+    components = [
+        component
+        if _COMPONENT.fullmatch(component) or "«" in component or "»" in component
+        else f"«{component}»"
+        for component in name.split(".")
+    ]
+    return "`" + ".".join(components)
+
+
 def _lean_driver(
     modules: Sequence[str], roots: Sequence[str], allowed: Sequence[str]
 ) -> str:
     imports = "\n".join(f"import {name}" for name in modules)
-    root_names = ", ".join(f"`{name}" for name in roots)
-    allowed_names = ", ".join(f"`{name}" for name in allowed)
+    root_names = ", ".join(_lean_name(name) for name in roots)
+    allowed_names = ", ".join(_lean_name(name) for name in allowed)
     return f"""{imports}
 import Lean.Util.FoldConsts
 

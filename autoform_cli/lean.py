@@ -189,6 +189,21 @@ def build_linker(
     )
 
 
+def repository_linker(
+    lean_root: str | Path,
+    *,
+    repository_url: str | None = None,
+    ref: str | None = None,
+) -> SourceLinker:
+    """Resolve repository coordinates for callers that already hold declarations."""
+    root_path = Path(lean_root).expanduser().resolve()
+    return SourceLinker(
+        index=SourceIndex(root=root_path, declarations={}, occurrences={}),
+        repository_url=repository_url or detect_repository_url(root_path),
+        ref=ref or detect_ref(root_path),
+    )
+
+
 def detect_repository_url(root: str | Path) -> str | None:
     """Find the project's web URL from the CI environment or the git remote."""
     repository = os.environ.get("GITHUB_REPOSITORY")

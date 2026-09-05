@@ -154,6 +154,11 @@ autoform declaration-closure --lean-root . --base <base-sha> \
 The command first builds the requested modules. It then traverses constants in
 the elaborated root types and in reachable definition values, while excluding
 theorem proof values, and retains declarations added or changed since the base.
+`--base` may name a branch: it is resolved through its merge base with `HEAD`,
+so commits that landed on the base branch after the fork point are not reported
+as changes. A declaration counts as changed when the diff adds or deletes lines
+inside it, and introduced `axiom` declarations are reported alongside
+definitions so that new assumptions cannot pass unreviewed.
 The JSON `definitions` array is ordered with dependencies before declarations
 that use them, and `dependency_edges` exposes the source-level graph behind that
 order. Consumers should preserve this order instead of reconstructing the
@@ -161,6 +166,10 @@ graph.
 If the modules do not build, it exits nonzero instead of returning an
 approximate source-text closure. Repeat `--module` and `--root` for multiple
 entries.
+
+`--lean-root` may point at a Lean project nested inside a larger repository. In
+that case `path` stays relative to the Lean root, `url` resolves against the
+repository root, and the dirty check considers only files under the Lean root.
 
 Validate structure, and optionally check that every `lean:` name really exists
 in the project's Lean sources:

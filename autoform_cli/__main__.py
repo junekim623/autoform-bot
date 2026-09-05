@@ -92,14 +92,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     article_ids.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
-    render = subparsers.add_parser
-
     closure = subparsers.add_parser(
         "declaration-closure",
         help="compute the exact PR-changed dependency closure of Lean declarations",
     )
     closure.add_argument("--lean-root", type=Path, default=Path("."))
-    closure.add_argument("--base", required=True, help="Git base revision for changed declarations")
+    closure.add_argument(
+        "--base",
+        required=True,
+        help="base branch or revision; compared through its merge base with HEAD",
+    )
     closure.add_argument("--module", action="append", required=True, help="Lean module to build and import")
     closure.add_argument("--root", action="append", required=True, help="source-facing Lean declaration")
     closure.add_argument("--json", action="store_true", help="write stable machine-readable output")
